@@ -16,5 +16,5 @@ dependencies = [
     "python-pid @ git+https://github.com/billtubbs/pid-ref.git",
 ]
 
-[tool.setuptools]
-py-modules = ["vel_pid_demo"]
+[tool.setuptools.packages.find]
+where = ["src"]

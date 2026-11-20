@@ -1,26 +1,33 @@
 """
 Demonstration of Velocity Form vs Positional Form PID Controllers
 
-Compares a textbook positional-form PID controller with the reference
-velocity-form (incremental) PID controller of Sundström et al. (2024),
-using the Python implementation in the pid-ref repository
-(https://github.com/billtubbs/pid-ref).
+Compares three PID controllers on a First Order Plus Dead Time (FOPDT)
+process, typical of many industrial processes like temperature control:
 
-The scenarios follow Rockwell Automation's PIDE instruction documentation
-(Logix-WP008B-EN-P). Both controllers control a First Order Plus Dead Time
-(FOPDT) process, which is typical of many industrial processes like
-temperature control.
+1. Positional form, as in Rockwell Automation's white paper
+   "Perform Common Process Loop Control Algorithms Using the PIDE
+   Instruction" (Logix-WP008), page 2:
+       CV = Kp*E + sum(Ki*E*Δt) + Kd*(E_n - E_{n-1})/Δt
+2. Velocity form, from the same page:
+       CV_n = CV_{n-1} + Kp*(E_n - E_{n-1}) + Ki*E_n*Δt
+              + Kd*(E_n - 2*E_{n-1} + E_{n-2})/Δt
+3. Reference PID of Sundström et al. (2024), a velocity (incremental)
+   form, using the Python implementation python_pid.PIDController from
+   https://github.com/billtubbs/pid-ref. It is configured to match the
+   Rockwell forms as closely as its parameters allow (see ReferencePID).
 
 Key demonstrations:
-1. Under normal operation (fixed gains) both forms give practically the
-   same response
-2. When the gains change, the positional form bumps its output because
-   its integral term Ki*sum(E*dt) is rescaled by the new Ki
-3. The velocity form keeps the accumulated integral action in the
-   previous output, so a gain change does not bump it. The reference
-   implementation stores the previous proportional term kp*(b*r - yf)
-   rather than the previous error, so a change in kp still gives a small
-   bump of size Delta-kp * E (zero when the error is zero)
+1. Under normal operation (fixed gains) all three give the same
+   response
+2. When the gains change, the positional form steps its output by
+   ΔKp × E because its proportional term works on the error directly.
+   At steady state (E = 0) there is no bump.
+3. The Rockwell velocity form works on the change in error, so a gain
+   change never bumps the output. The reference PID stores the previous
+   proportional term kp*(b*r - yf) rather than the previous error, so on
+   a change in kp it behaves like the positional form: the output steps
+   by ΔKp × E. In fact, summing its increments shows that it is the
+   positional form computed incrementally (see README.md)
 
 Plots are saved to the plots/ sub-folder.
 """
@@ -32,93 +39,38 @@ import matplotlib.pyplot as plt
 import numpy as np
 from python_pid import PIDController
 
+from rockwell_pid import PositionalPID, VelocityPID
+
 PLOTS_DIR = Path(__file__).resolve().parent / "plots"
 
 # Measurement filter time constant of the reference PID, as a multiple of
 # the sample time (Tf = TF_TS * dt). The reference PID always filters the
-# measurement with a second-order filter (default TfTs = 10). A small
-# value is used here so that the filter has a negligible effect and the
-# comparison isolates the difference between the two PID forms.
-TF_TS = 0.1
-
-
-class PositionalPID:
-    """
-    Positional Form PID Controller
-
-    From Rockwell documentation (page 2):
-    CV = Kp*E + Ki*sum(E*Δt) + Kd*(E - E_{n-1})/Δt
-
-    The integral term accumulates as a summation.
-    The proportional term works on error directly.
-    """
-
-    def __init__(self, Kp, Ki, Kd, dt, output_limits=(-100, 100)):
-        self.Kp = Kp
-        self.Ki = Ki
-        self.Kd = Kd
-        self.dt = dt
-        self.output_limits = output_limits
-
-        # State variables
-        self.integral = 0.0
-        self.prev_error = 0.0
-        self.output = 0.0
-
-    def update(self, setpoint, pv):
-        """Compute PID output using positional form"""
-        error = setpoint - pv
-
-        # Proportional term (works on error directly)
-        P = self.Kp * error
-
-        # Integral term (accumulates in separate variable)
-        self.integral += error * self.dt
-        I = self.Ki * self.integral
-
-        # Derivative term (works on change in error)
-        D = self.Kd * (error - self.prev_error) / self.dt
-
-        # Compute output
-        self.output = P + I + D
-
-        # Apply output limits
-        self.output = np.clip(self.output, *self.output_limits)
-
-        # Anti-windup: prevent integral from accumulating beyond limits
-        if (
-            self.output == self.output_limits[0]
-            or self.output == self.output_limits[1]
-        ):
-            self.integral = (
-                (self.output - P - D) / self.Ki if self.Ki != 0 else 0
-            )
-
-        self.prev_error = error
-
-        return self.output
-
-    def set_gains(self, Kp=None, Ki=None, Kd=None):
-        """Change controller gains (will cause bump if error exists)"""
-        if Kp is not None:
-            self.Kp = Kp
-        if Ki is not None:
-            self.Ki = Ki
-        if Kd is not None:
-            self.Kd = Kd
+# measurement with a second-order filter (default TfTs = 10) and the
+# Rockwell forms have no filter. TfTs = 0 is not allowed (division by
+# zero), but with TfTs = 0.001 the discretized filter coefficients are
+# exactly a11 = a12 = a21 = a22 = b2 = 0 and b1 = 1 in floating point, so
+# yf = y: the filter is switched off. It also sets the filtered
+# derivative dyf to 0, which switches off the derivative term, so this
+# setting is only suitable with Kd = 0.
+TF_TS = 0.001
 
 
 class ReferencePID:
     """
-    Velocity Form PID Controller (reference implementation)
+    Reference PID controller (Sundström et al., 2024)
 
-    Wraps python_pid.PIDController (Sundström et al., 2024) with the same
-    interface as PositionalPID, converting the continuous-time gains to
-    the per-sample gains it uses:
+    Wraps python_pid.PIDController with the same interface as the
+    Rockwell controllers, configured to match them as closely as
+    possible:
 
-        kp = Kp,  ki = Ki * Δt,  kd = Kd / Δt
+    - kp = Kp, ki = Ki * Δt, kd = Kd / Δt (it uses per-sample gains
+      with a normalized execution period Tx = 1)
+    - Setpoint weight b = 1, so the P term acts on the error
+    - Bias u0 = 0 and the same output limits
+    - Measurement filter switched off with TfTs = TF_TS
+    - No feedforward, manual, tracking or external windup signals
 
-    Control signal increments (with Tx = 1, setpoint weight b = 1):
+    Control signal increments (with Tx = 1, b = 1):
 
         ΔCV = kp*(r - yf) - up_old + ki*(r - yf) + (-kd*dyf - ud_old)
         CV_n = CV_{n-1} + ΔCV
@@ -126,6 +78,13 @@ class ReferencePID:
     where yf and dyf are the filtered measurement and its derivative, and
     up_old, ud_old are the proportional and derivative terms from the
     previous step. The integral accumulation is contained in CV_{n-1}.
+
+    Differences that remain from the Rockwell velocity form:
+    - P increment is kp_n*E_n - kp_{n-1}*E_{n-1} rather than
+      Kp*(E_n - E_{n-1}), so a change in kp steps the output by ΔKp × E
+      (like the positional form)
+    - Derivative acts on the filtered measurement, not the error
+      (and is switched off by TF_TS, see above)
     """
 
     def __init__(self, Kp, Ki, Kd, dt, output_limits=(-100, 100), TfTs=TF_TS):
@@ -137,6 +96,8 @@ class ReferencePID:
             TfTs=TfTs,
             umin=output_limits[0],
             umax=output_limits[1],
+            u0=0.0,
+            b=1.0,
         )
 
     def update(self, setpoint, pv):
@@ -151,6 +112,14 @@ class ReferencePID:
             self.pid.ki = Ki * self.dt
         if Kd is not None:
             self.pid.kd = Kd / self.dt
+
+
+# Controllers compared in each scenario, with plot line styles
+CONTROLLERS = {
+    "Positional": (PositionalPID, "-"),
+    "Velocity": (VelocityPID, "--"),
+    "Reference": (ReferencePID, "-."),
+}
 
 
 class FOPDTProcess:
@@ -204,7 +173,6 @@ class FOPDTProcess:
 
 
 def simulate_scenario(
-    scenario_name,
     process,
     controller,
     setpoint_profile,
@@ -245,7 +213,6 @@ def simulate_scenario(
             and gain_change_time <= t < gain_change_time + dt
         ):
             controller.set_gains(**new_gains)
-            print(f"  {scenario_name}: Gains changed at t={t:.1f}s")
 
         # PID control
         error = current_setpoint - process.pv  # error seen by controller
@@ -268,6 +235,34 @@ def simulate_scenario(
     }
 
 
+def run_controllers(
+    process_params,
+    gains,
+    dt,
+    setpoint_profile,
+    gain_change_time=None,
+    new_gains=None,
+    duration=100,
+):
+    """Simulate every controller in CONTROLLERS on the same scenario.
+
+    Returns a dict of results keyed by controller name.
+    """
+    results = {}
+    for name, (controller_class, _) in CONTROLLERS.items():
+        process = FOPDTProcess(**process_params, dt=dt)
+        controller = controller_class(*gains, dt)
+        results[name] = simulate_scenario(
+            process,
+            controller,
+            setpoint_profile,
+            gain_change_time=gain_change_time,
+            new_gains=new_gains,
+            duration=duration,
+        )
+    return results
+
+
 def make_ts_plot(results_dict, title, filename=None):
     """Plot time series of simulation results from several controllers.
 
@@ -276,12 +271,20 @@ def make_ts_plot(results_dict, title, filename=None):
     """
     fig, axes = plt.subplots(3, 1, figsize=(7, 5.5), sharex=True)
 
+    def linestyle(name):
+        return CONTROLLERS[name][1] if name in CONTROLLERS else "-"
+
     ax = axes[0]
     for name, results in results_dict.items():
-        ax.plot(results["time"], results["pv"], label=name, alpha=0.8)
-    setpoint = next(iter(results_dict.values()))["setpoint"]
-    time = next(iter(results_dict.values()))["time"]
-    ax.plot(time, setpoint, "k:", label="Setpoint")
+        ax.plot(
+            results["time"],
+            results["pv"],
+            linestyle(name),
+            label=name,
+            alpha=0.8,
+        )
+    first = next(iter(results_dict.values()))
+    ax.plot(first["time"], first["setpoint"], "k:", label="Setpoint")
     ax.set_ylabel("PV")
     ax.legend(loc="best")
     ax.grid(True)
@@ -289,14 +292,26 @@ def make_ts_plot(results_dict, title, filename=None):
 
     ax = axes[1]
     for name, results in results_dict.items():
-        ax.plot(results["time"], results["error"], label=name, alpha=0.8)
+        ax.plot(
+            results["time"],
+            results["error"],
+            linestyle(name),
+            label=name,
+            alpha=0.8,
+        )
     ax.set_ylabel("Error")
     ax.grid(True)
     ax.set_title("Control error")
 
     ax = axes[2]
     for name, results in results_dict.items():
-        ax.plot(results["time"], results["output"], label=name, alpha=0.8)
+        ax.plot(
+            results["time"],
+            results["output"],
+            linestyle(name),
+            label=name,
+            alpha=0.8,
+        )
     ax.set_ylabel("CV")
     ax.set_xlabel("Time (s)")
     ax.grid(True)
@@ -314,9 +329,34 @@ def make_ts_plot(results_dict, title, filename=None):
     return fig, axes
 
 
-def output_bump(results, idx):
+def output_step(results, idx):
     """Change in controller output at time step idx"""
     return results["output"][idx] - results["output"][idx - 1]
+
+
+def print_gain_change_analysis(results, idx, d_Kp):
+    """Print the output step at a gain change for each controller,
+    and the part of it theoretically caused by the gain change."""
+    # Error seen by the controllers at the gain change (practically the
+    # same for all three before the change)
+    error = results["Positional"]["error"][idx]
+    print(f"\n  Error at gain change:  E = {error:.4f}")
+
+    theory = {
+        "Positional": ("ΔKp × E", d_Kp * error),
+        "Velocity": ("0", 0.0),
+        "Reference": ("ΔKp × E", d_Kp * error),
+    }
+    print("\n  Output step at gain change:")
+    print(f"    {'Controller':<12}{'Simulated':>12}   Due to gain change")
+    for name in CONTROLLERS:
+        expr, value = theory[name]
+        print(
+            f"    {name:<12}{output_step(results[name], idx):>12.4f}"
+            f"   {expr} = {value:.4f}"
+        )
+    print("  (The simulated step also includes the normal change in output")
+    print("  over one time step.)")
 
 
 def main():
@@ -325,9 +365,10 @@ def main():
     print("=" * 80)
     print("PID Controller Comparison: Velocity Form vs Positional Form")
     print("=" * 80)
-    print("\nPositional form: textbook (Rockwell PIDE documentation)")
-    print("Velocity form:   reference PID of Sundström et al. (2024)")
-    print(f"                 (measurement filter TfTs = {TF_TS})")
+    print("\nPositional: positional form (Rockwell white paper Logix-WP008)")
+    print("Velocity:   velocity form (Rockwell white paper Logix-WP008)")
+    print("Reference:  reference PID of Sundström et al. (2024)")
+    print(f"            (measurement filter TfTs = {TF_TS})")
     print("\nProcess Model: First Order Plus Dead Time (FOPDT)")
     print("  - Process Gain (K): 1.0")
     print("  - Time Constant (τ): 10.0 seconds")
@@ -345,11 +386,13 @@ def main():
     tau = 10.0
     theta = 2.0
     lambda_tune = theta
+    process_params = {"K": K_process, "tau": tau, "theta": theta}
 
     Kp = tau / (K_process * (lambda_tune + theta))
     Ti = tau
     Ki = Kp / Ti  # Convert to gain form
     Kd = 0.0  # Keep it simple - no derivative action
+    gains = (Kp, Ki, Kd)
 
     print("\nInitial PID Tuning (Lambda Tuning Method):")
     print(f"  Kp = {Kp:.3f}")
@@ -357,59 +400,36 @@ def main():
     print(f"  Kd = {Kd:.3f}")
 
     # ===================================================================
-    # SCENARIO 1: Normal Operation - Both Forms (Practically) Identical
+    # SCENARIO 1: Normal Operation - All Forms (Practically) Identical
     # ===================================================================
     print("\n" + "-" * 80)
     print("SCENARIO 1: Normal Operation (Setpoint Changes)")
     print("-" * 80)
-    print("Both forms should give practically identical responses")
+    print("All three should give practically identical responses")
 
     setpoint_profile_1 = [(0, 0), (10, 10), (40, 15), (70, 5)]
-
-    # Positional form
-    process_pos_1 = FOPDTProcess(K=K_process, tau=tau, theta=theta, dt=dt)
-    controller_pos_1 = PositionalPID(Kp, Ki, Kd, dt)
-    results_pos_1 = simulate_scenario(
-        "Positional Form",
-        process_pos_1,
-        controller_pos_1,
-        setpoint_profile_1,
-        duration=100,
-    )
-
-    # Velocity form
-    process_vel_1 = FOPDTProcess(K=K_process, tau=tau, theta=theta, dt=dt)
-    controller_vel_1 = ReferencePID(Kp, Ki, Kd, dt)
-    results_vel_1 = simulate_scenario(
-        "Velocity Form",
-        process_vel_1,
-        controller_vel_1,
-        setpoint_profile_1,
-        duration=100,
-    )
-
-    # Calculate performance metrics
-    iae_pos = np.sum(np.abs(results_pos_1["error"])) * dt
-    iae_vel = np.sum(np.abs(results_vel_1["error"])) * dt
-    max_diff = np.max(np.abs(results_pos_1["output"] - results_vel_1["output"]))
+    results_1 = run_controllers(process_params, gains, dt, setpoint_profile_1)
 
     print("\nPerformance Metrics:")
-    print(f"  Positional Form IAE: {iae_pos:.4f}")
-    print(f"  Velocity Form IAE:   {iae_vel:.4f}")
-    print(f"  Difference:          {abs(iae_pos - iae_vel):.6f}")
-    print(f"  Max difference in controller output: {max_diff:.6f}")
+    print(f"  {'Controller':<12}{'IAE':>10}{'Max |ΔCV| vs Positional':>27}")
+    for name, results in results_1.items():
+        iae = np.sum(np.abs(results["error"])) * dt
+        max_diff = np.max(
+            np.abs(results["output"] - results_1["Positional"]["output"])
+        )
+        print(f"  {name:<12}{iae:>10.4f}{max_diff:>27.6f}")
 
     make_ts_plot(
-        {"Positional Form": results_pos_1, "Velocity Form": results_vel_1},
+        results_1,
         "Scenario 1: Normal Operation",
         "scenario1_normal_operation.png",
     )
 
     # ===================================================================
-    # SCENARIO 2: Adaptive Gains - Key Advantage of Velocity Form
+    # SCENARIO 2: Adaptive Gains at Steady State
     # ===================================================================
     print("\n" + "-" * 80)
-    print("SCENARIO 2: Adaptive Gains (Key Advantage of Velocity Form)")
+    print("SCENARIO 2: Adaptive Gains at Steady State")
     print("-" * 80)
     print("Simulating heat/cool process where gains change")
     print("(like extrusion machine example in Rockwell document)")
@@ -421,132 +441,71 @@ def main():
     ]
 
     # New gains for "cooling mode" (more aggressive)
-    new_Kp = Kp * 2.0
-    new_Ki = Ki * 2.0
-    new_gains = {"Kp": new_Kp, "Ki": new_Ki}
-
+    new_Kp = Kp * 1.5
+    new_Ki = Ki * 1.5
     gain_change_time = 50.0
 
     print(f"\nGain change at t={gain_change_time}s (process at steady state):")
     print(f"  Old Kp = {Kp:.3f}, New Kp = {new_Kp:.3f}")
     print(f"  Old Ki = {Ki:.3f}, New Ki = {new_Ki:.3f}")
 
-    # Positional form with gain change
-    process_pos_2 = FOPDTProcess(K=K_process, tau=tau, theta=theta, dt=dt)
-    controller_pos_2 = PositionalPID(Kp, Ki, Kd, dt)
-    results_pos_2 = simulate_scenario(
-        "Positional Form (with gain change)",
-        process_pos_2,
-        controller_pos_2,
+    results_2 = run_controllers(
+        process_params,
+        gains,
+        dt,
         setpoint_profile_2,
         gain_change_time=gain_change_time,
-        new_gains=new_gains,
-        duration=100,
+        new_gains={"Kp": new_Kp, "Ki": new_Ki},
     )
-
-    # Velocity form with gain change
-    process_vel_2 = FOPDTProcess(K=K_process, tau=tau, theta=theta, dt=dt)
-    controller_vel_2 = ReferencePID(Kp, Ki, Kd, dt)
-    results_vel_2 = simulate_scenario(
-        "Velocity Form (with gain change)",
-        process_vel_2,
-        controller_vel_2,
-        setpoint_profile_2,
-        gain_change_time=gain_change_time,
-        new_gains=new_gains,
-        duration=100,
+    print_gain_change_analysis(
+        results_2, int(gain_change_time / dt), new_Kp - Kp
     )
-
-    # Find the output bumps at the gain change
-    idx = int(gain_change_time / dt)
-    error = results_pos_2["error"][idx]
-    integral = np.sum(results_pos_2["error"][:idx]) * dt
-
-    print("\nOutput Bump Analysis:")
-    print(f"  Error at gain change:     {error:.4f}")
-    print(f"  Integral of error:        {integral:.4f}")
-    print(f"  Positional Form bump:     {output_bump(results_pos_2, idx):.4f}")
-    print(f"  Velocity Form bump:       {output_bump(results_vel_2, idx):.4f}")
-    print("\n  Theoretical bumps:")
-    print(
-        f"    Positional: ΔKp × E + ΔKi × ∫E = "
-        f"{(new_Kp - Kp) * error + (new_Ki - Ki) * integral:.4f}"
-    )
-    print(f"    Velocity:   ΔKp × E            = {(new_Kp - Kp) * error:.4f}")
 
     make_ts_plot(
-        {"Positional Form": results_pos_2, "Velocity Form": results_vel_2},
-        "Scenario 2: Adaptive Gains",
+        results_2,
+        "Scenario 2: Gain Change at Steady State",
         "scenario2_adaptive_gains.png",
     )
 
     # ===================================================================
-    # SCENARIO 3: Large Error at Gain Change
+    # SCENARIO 3: Gain Change With Error - Key Advantage of Velocity Form
     # ===================================================================
     print("\n" + "-" * 80)
-    print("SCENARIO 3: Large Error During Gain Change")
+    print("SCENARIO 3: Gain Change With Error (Key Advantage of Velocity Form)")
     print("-" * 80)
-    print("Gain change shortly after a large setpoint change")
+    print("Gain change while the error is still large after a setpoint change")
+    print("(like the 5% error example on pages 4-5 of the Rockwell document)")
 
     setpoint_profile_3 = [
         (0, 0),
         (10, 10),
         (30, 20),  # Large setpoint change
-        (50, 20),  # Change gains while tracking
     ]
 
-    # Even more aggressive gains
-    new_Kp_3 = Kp * 3.0
-    new_Ki_3 = Ki * 3.0
-    new_gains_3 = {"Kp": new_Kp_3, "Ki": new_Ki_3}
+    # More aggressive gains (tripling them makes the loop oscillate)
+    new_Kp_3 = Kp * 2.0
+    new_Ki_3 = Ki * 2.0
+    gain_change_time_3 = 34.0  # Error is about 5
 
-    gain_change_time_3 = 50.0
+    print(f"\nGain change at t={gain_change_time_3}s:")
+    print(f"  Old Kp = {Kp:.3f}, New Kp = {new_Kp_3:.3f}")
+    print(f"  Old Ki = {Ki:.3f}, New Ki = {new_Ki_3:.3f}")
 
-    # Positional form
-    process_pos_3 = FOPDTProcess(K=K_process, tau=tau, theta=theta, dt=dt)
-    controller_pos_3 = PositionalPID(Kp, Ki, Kd, dt)
-    results_pos_3 = simulate_scenario(
-        "Positional Form (large error)",
-        process_pos_3,
-        controller_pos_3,
+    results_3 = run_controllers(
+        process_params,
+        gains,
+        dt,
         setpoint_profile_3,
         gain_change_time=gain_change_time_3,
-        new_gains=new_gains_3,
-        duration=100,
+        new_gains={"Kp": new_Kp_3, "Ki": new_Ki_3},
     )
-
-    # Velocity form
-    process_vel_3 = FOPDTProcess(K=K_process, tau=tau, theta=theta, dt=dt)
-    controller_vel_3 = ReferencePID(Kp, Ki, Kd, dt)
-    results_vel_3 = simulate_scenario(
-        "Velocity Form (large error)",
-        process_vel_3,
-        controller_vel_3,
-        setpoint_profile_3,
-        gain_change_time=gain_change_time_3,
-        new_gains=new_gains_3,
-        duration=100,
+    print_gain_change_analysis(
+        results_3, int(round(gain_change_time_3 / dt)), new_Kp_3 - Kp
     )
-
-    idx_3 = int(gain_change_time_3 / dt)
-    error_3 = results_pos_3["error"][idx_3]
-    integral_3 = np.sum(results_pos_3["error"][:idx_3]) * dt
-
-    print("\nLarge Error Scenario:")
-    print(f"  Error at gain change:     {error_3:.4f}")
-    print(f"  Integral of error:        {integral_3:.4f}")
-    print(f"  Positional Form bump:     {output_bump(results_pos_3, idx_3):.4f}")
-    print(f"  Velocity Form bump:       {output_bump(results_vel_3, idx_3):.4f}")
-    print("\n  Theoretical bumps:")
-    print(
-        f"    Positional: ΔKp × E + ΔKi × ∫E = "
-        f"{(new_Kp_3 - Kp) * error_3 + (new_Ki_3 - Ki) * integral_3:.4f}"
-    )
-    print(f"    Velocity:   ΔKp × E            = {(new_Kp_3 - Kp) * error_3:.4f}")
 
     make_ts_plot(
-        {"Positional Form": results_pos_3, "Velocity Form": results_vel_3},
-        "Scenario 3: Large Error During Gain Change",
+        results_3,
+        "Scenario 3: Gain Change With Error",
         "scenario3_large_error.png",
     )
 
@@ -559,22 +518,27 @@ def main():
     print("""
 1. SAME PERFORMANCE UNDER NORMAL CONDITIONS:
    With fixed gains, the positional and velocity forms are mathematically
-   equivalent. Small differences here come from the reference PID's
-   measurement filter (TfTs).
+   equivalent, and all three give the same response.
 
-2. INTEGRAL TERM: WHERE THE BUMP COMES FROM
-   - Positional: integral accumulated in a separate sum, I = Ki × ∫E,
-     so changing Ki rescales the whole accumulated integral:
-     Bump = ΔKp × E + ΔKi × ∫E (large even when E = 0)
-   - Velocity: integral accumulated in the previous output (CV_{n-1}),
-     so changing Ki only affects future increments
+2. GAIN CHANGES: THE PROPORTIONAL TERM MAKES THE DIFFERENCE
+   - Positional: the P term works on the error, Kp × E, so a gain change
+     steps the output by ΔKp × E. No bump at steady state (E = 0), but a
+     large one if there is an error.
+   - Rockwell velocity form: the P term works on the change in error,
+     Kp × (E_n - E_{n-1}), so a gain change never bumps the output.
+   - In both Rockwell forms Ki is applied to each increment, Ki × E × Δt, so a
+     change in Ki only affects future integral action.
 
-3. PROPORTIONAL TERM IN THE REFERENCE PID:
-   - The reference PID stores the previous proportional term
-     kp × (b × r - yf), not the previous error, so a change in kp gives
-     Bump = ΔKp × E. This is zero at steady state and small when the
-     error is small.
-   - The textbook velocity form Kp × (E_n - E_{n-1}) has no bump at all
+3. THE REFERENCE PID BEHAVES LIKE THE POSITIONAL FORM ON A KP CHANGE
+   - It stores the previous P term, kp × (b × r - yf), not the previous
+     error, so a change in kp also steps the output by ΔKp × E
+   - Summing its increments, the stored P terms cancel and leave
+     CV_n = kp_n × E_n + sum(ki × E): the positional form, computed
+     incrementally
+   - The trade-off: the new kp takes effect immediately and the output
+     always equals current P + D terms + accumulated integral, which is
+     also what lets it add the bias u0 in P and PD control. In the
+     Rockwell velocity form the effect of the old Kp stays in CV_{n-1}.
 
 4. PRACTICAL IMPLICATIONS (from Rockwell document):
    - Velocity form is used in most DCS systems
@@ -585,7 +549,7 @@ def main():
 
     print(f"\nAll plots saved to {PLOTS_DIR.name}/")
     print("\nFor more details, see:")
-    print("  Rockwell Automation Logix-WP008B-EN-P")
+    print("  Rockwell Automation Logix-WP008")
     print(
         "  'Perform Common Process Loop Control Algorithms Using the PIDE Instruction'"
     )
