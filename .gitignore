@@ -1,0 +1,6 @@
+plots
+
+__pycache__/
+*.egg-info/
+.venv/
+.DS_Store

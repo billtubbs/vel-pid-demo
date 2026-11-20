@@ -1,0 +1,5 @@
+numpy>=1.20.0
+matplotlib>=3.5
+# Reference PID implementation (Sundström et al., 2024).
+# For a local editable copy instead, use: -e ../pid-ref
+python-pid @ git+https://github.com/billtubbs/pid-ref.git
